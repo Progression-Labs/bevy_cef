@@ -75,8 +75,9 @@ pub struct CefPlugin {
     /// Linux: CEF composites pages on the GPU and lends each frame as a dmabuf to the app's
     /// `GpuPaintSink` (`Browsers::set_gpu_paint_sink`), which copies it out on the GPU before
     /// CEF takes it back (`WebviewGpuPainted` follows), instead of copying its pixels to the
-    /// CPU. Adds the switches CEF's GPU path needs (Wayland ozone, ANGLE on GL/EGL), so not
-    /// with `ozone-platform=headless`. On by default (Linux).
+    /// CPU. Adds the switches CEF's GPU path needs (Wayland ozone, ANGLE on GL/EGL, WebGPU off
+    /// Vulkan: `gpu_paint::SWITCHES`), so not with `ozone-platform=headless`. On by default
+    /// (Linux).
     ///
     /// Checked before CEF starts: without a reachable Wayland compositor it warns and pages
     /// paint on the CPU (no switches added), since Chromium would exit the app after failing to
@@ -108,6 +109,7 @@ impl Plugin for CefPlugin {
         // Resolve the sandbox decision and compute the effective command line once.
         let no_sandbox = resolve_no_sandbox(self.sandbox);
         let strip_no_zygote = cfg!(target_os = "linux") && !no_sandbox;
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut command_line_config = self.command_line_config.clone();
         #[cfg(target_os = "linux")]
         let gpu_paint = self.gpu_paint
@@ -116,19 +118,9 @@ impl Plugin for CefPlugin {
                 .is_ok();
         #[cfg(not(target_os = "linux"))]
         let gpu_paint = false;
+        #[cfg(target_os = "linux")]
         if gpu_paint {
-            // Only Wayland ozone with ANGLE on GL/EGL hands NVIDIA's tiled buffers over with the
-            // page in them: under X11 (XWayland) EGL rejects them and Vulkan leaves them empty,
-            // and Chromium refuses Vulkan on Wayland. Chromium keeps only the last value of a
-            // repeated switch, so these replace the app's own.
-            let values = &mut command_line_config.switch_values;
-            for (name, value) in [("ozone-platform", "wayland"), ("use-angle", "gl-egl")] {
-                if let Some(old) = values.iter().find(|(n, v)| *n == name && *v != value) {
-                    warn!("gpu_paint: {name}={} replaced by {name}={value}", old.1);
-                }
-                values.retain(|(n, _)| *n != name);
-                values.push((name, value));
-            }
+            gpu_paint::apply_switches(&mut command_line_config);
         }
         let effective_config =
             effective_command_line_config(&command_line_config, strip_no_zygote);

@@ -266,11 +266,6 @@ impl ImplRenderHandler for RenderHandlerBuilder {
         1
     }
 
-    // macOS uses the GPU accelerated-paint path (on_accelerated_paint);
-    // `on_paint` is never called when `shared_texture_enabled` is true, so we
-    // don't override it at all on macOS (the trait provides a default no-op).
-    #[cfg(not(target_os = "macos"))]
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn on_virtual_keyboard_requested(
         &self,
         _browser: Option<&mut Browser>,
@@ -280,6 +275,11 @@ impl ImplRenderHandler for RenderHandlerBuilder {
         self.text_input.set(!none);
     }
 
+    // macOS uses the GPU accelerated-paint path (on_accelerated_paint);
+    // `on_paint` is never called when `shared_texture_enabled` is true, so we
+    // don't override it at all on macOS (the trait provides a default no-op).
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn on_paint(
         &self,
         _browser: Option<&mut Browser>,

@@ -13,11 +13,11 @@ use bevy::ecs::system::SystemParam;
 use bevy::ecs::world::DeferredWorld;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::prelude::*;
+#[cfg(feature = "brp")]
+use bevy::remote::BrpSender;
 use bevy::window::PrimaryWindow;
 use bevy::winit::WINIT_WINDOWS;
 use bevy_cef_core::prelude::*;
-#[cfg(feature = "brp")]
-use bevy::remote::BrpSender;
 #[allow(deprecated)]
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
@@ -27,12 +27,12 @@ pub(crate) mod image;
 
 pub mod prelude {
     pub use crate::common::*;
+    #[cfg(target_os = "linux")]
+    pub use crate::webview::image::WebviewGpuPainted;
     pub use crate::webview::{
         BeginFrameInterval, RequestCloseDevtool, RequestShowDevTool, WebviewPlugin,
         image::ImageWebviewPlugin,
     };
-    #[cfg(target_os = "linux")]
-    pub use crate::webview::image::WebviewGpuPainted;
 }
 
 /// A Trigger event to request showing the developer tools in a webview.
@@ -351,4 +351,3 @@ fn apply_request_show_devtool(trigger: On<RequestShowDevTool>, browsers: NonSend
 fn apply_request_close_devtool(trigger: On<RequestCloseDevtool>, browsers: NonSend<Browsers>) {
     browsers.close_devtools(&trigger.webview);
 }
-

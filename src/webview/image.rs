@@ -24,10 +24,8 @@ impl Plugin for ImageWebviewPlugin {
                 ),
             );
         #[cfg(target_os = "linux")]
-        app.add_message::<WebviewGpuPainted>().add_systems(
-            PostUpdate,
-            paint_gpu_targets.before(AssetEventSystems),
-        );
+        app.add_message::<WebviewGpuPainted>()
+            .add_systems(PostUpdate, paint_gpu_targets.before(AssetEventSystems));
     }
 }
 

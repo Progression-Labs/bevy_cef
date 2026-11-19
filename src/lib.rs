@@ -28,11 +28,11 @@ use crate::profile::ProfilePlugin;
 use crate::title::TitlePlugin;
 use crate::zoom::ZoomPlugin;
 use bevy::prelude::*;
+#[cfg(feature = "brp")]
+use bevy::remote::RemotePlugin;
 use bevy_cef_core::prelude::{
     CefCustomScheme, CefExtensions, CommandLineConfig, effective_command_line_config, switches,
 };
-#[cfg(feature = "brp")]
-use bevy::remote::RemotePlugin;
 use std::time::Duration;
 
 pub mod prelude {
@@ -45,9 +45,9 @@ pub mod prelude {
     };
     pub use crate::{CefPlugin, RunOnMainThread, navigation::*, title::*, webview::prelude::*};
     pub use bevy_cef_core::prelude::{
-        Browsers, RenderTextureMessage, WebviewPainted, CefCustomScheme, create_cef_key_events,
-        keyboard_modifiers, CefExtensions, CefSchemeBody, CefSchemeHandler, CefSchemeOptions,
-        CefSchemeRequest, CefSchemeResponse, CommandLineConfig, switches,
+        Browsers, CefCustomScheme, CefExtensions, CefSchemeBody, CefSchemeHandler,
+        CefSchemeOptions, CefSchemeRequest, CefSchemeResponse, CommandLineConfig,
+        RenderTextureMessage, WebviewPainted, create_cef_key_events, keyboard_modifiers, switches,
     };
     #[cfg(target_os = "linux")]
     pub use bevy_cef_core::prelude::{DmabufPaint, GpuPaintSink};
@@ -122,8 +122,7 @@ impl Plugin for CefPlugin {
         if gpu_paint {
             gpu_paint::apply_switches(&mut command_line_config);
         }
-        let effective_config =
-            effective_command_line_config(&command_line_config, strip_no_zygote);
+        let effective_config = effective_command_line_config(&command_line_config, strip_no_zygote);
 
         // Warn when any security-relaxing switch is active (based on the EFFECTIVE set).
         let risky = switches::risky_present(&effective_config.switches);

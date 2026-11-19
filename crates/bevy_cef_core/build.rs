@@ -17,10 +17,11 @@ fn main() {
 fn install(src: &Path, dest: &Path) {
     let src_meta = fs::metadata(src).unwrap();
     let src_modified = src_meta.modified().unwrap();
-    if let Ok(dst_meta) = fs::metadata(dest) {
-        if dst_meta.len() == src_meta.len() && dst_meta.modified().unwrap() == src_modified {
-            return;
-        }
+    if let Ok(dst_meta) = fs::metadata(dest)
+        && dst_meta.len() == src_meta.len()
+        && dst_meta.modified().unwrap() == src_modified
+    {
+        return;
     }
     // Replaced by rename: the old one may be running (text file busy, or a mapped libcef.so).
     let name = dest.file_name().unwrap().to_string_lossy();

@@ -46,7 +46,6 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 bevy = { git = "https://github.com/bevyengine/bevy", branch = "main", default-features = false }
 cef = { version = "=156.2.0+156.0.14" }
 cef-dll-sys = { version = "=156.2.0+156.0.14", features = ["sandbox"] }
-bevy_cef = { path = ".", version = "0.15.0" }
 bevy_cef_core = { path = "crates/bevy_cef_core", version = "0.15.0", default-features = false }
 async-channel = { version = "2.5" }
 serde = { version = "1", features = ["derive"] }

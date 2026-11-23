@@ -383,24 +383,35 @@ fn cef_initialize(
 #[cfg(target_os = "linux")]
 const APP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
-/// Runs `f` (CEF's initialize) and gives the [`APP_SIGNALS`] back what they were before it, also
-/// when `f` unwinds. With Chromium's shutdown detector on SIGTERM and SIGHUP the process ended
-/// with status 0 half a second after either, no teardown and nothing logged: anything that
-/// stopped the app (a timeout, a memory cap's OOM kill stopping its systemd scope) read as
-/// success, and a zero benchmark the OOM killer stopped mid-load went up as a run.
-/// Setting `disable_signal_handlers` does not keep them, so it stays false: measured on zero's
-/// game with it true (Linux, CEF 156, under `strace -f`), libcef.so installed its handlers
-/// during initialize and nothing after it in the next 60 s of play, and a SIGTERM then ended the
-/// game 0 after 0.50 s; with this, the game is killed by the SIGTERM (143). The detector's thread is left waiting on its pipe for a
-/// signal that never comes. A signal that arrives while initialize runs (its first half second
-/// in zero's game) still meets the detector: the app's whole life after it does not.
+/// Runs `f` (CEF's initialize) with the [`APP_SIGNALS`] blocked on this thread, then gives each
+/// back the disposition it had before and lets them through: a signal that came meanwhile waited
+/// and meets the app's disposition, never Chromium's. With Chromium's shutdown detector on
+/// SIGTERM and SIGHUP the process ended with status 0 half a second after either, no teardown
+/// and nothing logged: anything that stopped the app (a timeout, a memory cap's OOM kill stopping
+/// its systemd scope) read as success, and a zero benchmark the OOM killer stopped mid-load went
+/// up as a run. Setting `disable_signal_handlers` does not keep them, so it stays false: measured
+/// on zero's game with it true (Linux, CEF 156, under `strace -f`), libcef.so installed its
+/// handlers during initialize and nothing after it in the next 60 s of play, and a SIGTERM then
+/// ended the game 0 after 0.50 s; with this, the game is killed by the SIGTERM (143). Chromium
+/// installs them once, as its browser main loop starts inside initialize, so the restore holds
+/// for the app's life; the detector's thread is left waiting on its pipe for a signal that never
+/// comes. What it costs: the threads CEF starts during initialize keep the three blocked, so
+/// such a signal is taken on another of the app's threads (a disposition is the process's, not a
+/// thread's); and a SIGTERM'd app's CEF children see their parent's pipe close and go, as they do
+/// when it is SIGKILLed, where the detector's status 0 gave them no more teardown than that.
+/// The restore runs when `f` returns or unwinds; a panic inside CEF's own call (a callback)
+/// aborts at the FFI boundary instead.
 #[cfg(target_os = "linux")]
 fn keeping_app_signals<T>(f: impl FnOnce() -> T) -> T {
-    /// Puts each disposition read back when dropped: after `f`, returned or unwound.
-    struct Kept(Vec<(libc::c_int, libc::sigaction)>);
+    /// When dropped (after `f`, returned or unwound): puts each disposition read back, then this
+    /// thread's signal mask as it was, so what waited is delivered to the app's disposition.
+    struct Kept {
+        dispositions: Vec<(libc::c_int, libc::sigaction)>,
+        mask: Option<libc::sigset_t>,
+    }
     impl Drop for Kept {
         fn drop(&mut self) {
-            for (signal, was) in &self.0 {
+            for (signal, was) in &self.dispositions {
                 // SAFETY: sigaction(2) putting back a disposition it read.
                 if unsafe { libc::sigaction(*signal, was, std::ptr::null_mut()) } != 0 {
                     bevy::log::warn!(
@@ -409,10 +420,34 @@ fn keeping_app_signals<T>(f: impl FnOnce() -> T) -> T {
                     );
                 }
             }
+            if let Some(mask) = &self.mask {
+                // SAFETY: pthread_sigmask(3) putting back the mask it read.
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
+            }
         }
     }
-    let _kept = Kept(
-        APP_SIGNALS
+    // SAFETY: sigemptyset/sigaddset(3) on a zeroed set, pthread_sigmask(3) reading the old mask
+    // into a zeroed set.
+    let mask = unsafe {
+        let mut app_signals: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut app_signals);
+        for signal in APP_SIGNALS {
+            libc::sigaddset(&mut app_signals, signal);
+        }
+        let mut was: libc::sigset_t = std::mem::zeroed();
+        match libc::pthread_sigmask(libc::SIG_BLOCK, &app_signals, &mut was) {
+            0 => Some(was),
+            error => {
+                bevy::log::warn!(
+                    "CEF: SIGTERM, SIGINT and SIGHUP could not be held back during CEF's initialize ({}): one that comes then meets Chromium's shutdown detector",
+                    std::io::Error::from_raw_os_error(error)
+                );
+                None
+            }
+        }
+    };
+    let _kept = Kept {
+        dispositions: APP_SIGNALS
             .into_iter()
             .filter_map(|signal| {
                 // SAFETY: sigaction(2) reading a signal's disposition into a zeroed struct.
@@ -429,7 +464,8 @@ fn keeping_app_signals<T>(f: impl FnOnce() -> T) -> T {
                 }
             })
             .collect(),
-    );
+        mask,
+    };
     f()
 }
 
@@ -708,10 +744,13 @@ mod tests {
     use crate::common::JsEmitEventPlugin;
 
     /// Asserts that whatever CEF's initialize puts on SIGTERM, SIGINT and SIGHUP is undone: each
-    /// signal's disposition after it is the one before it, also when it unwinds.
+    /// signal's disposition after it is the one before it, also when it unwinds, and a signal
+    /// that comes while it runs is delivered to the app's handler once it is back.
     ///
     /// Case: a stand-in for initialize that installs a handler on each, as Chromium's shutdown
-    /// detector does (it ended a SIGTERM'd game with status 0), then one that also panics.
+    /// detector does (it ended a SIGTERM'd game with status 0), then one that also panics, then
+    /// one that raises SIGHUP after taking it. One test, since the dispositions are the whole
+    /// test binary's: no other test here touches them.
     #[cfg(target_os = "linux")]
     #[test]
     fn initialize_leaves_the_apps_signals_as_it_had_them() {
@@ -746,6 +785,30 @@ mod tests {
         assert_eq!(after, before);
         assert!(unwound.is_err());
         assert_eq!(after_unwinding, before);
+
+        static APPS: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+        extern "C" fn apps(signal: libc::c_int) {
+            APPS.store(signal, std::sync::atomic::Ordering::Relaxed);
+        }
+        let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+        unsafe {
+            let mut app: libc::sigaction = std::mem::zeroed();
+            app.sa_sigaction = apps as *const () as libc::sighandler_t;
+            libc::sigaction(libc::SIGHUP, &app, &mut was);
+        }
+        let during = keeping_app_signals(|| {
+            take();
+            unsafe { libc::raise(libc::SIGHUP) };
+            APPS.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        let delivered = APPS.load(std::sync::atomic::Ordering::Relaxed);
+        unsafe { libc::sigaction(libc::SIGHUP, &was, std::ptr::null_mut()) };
+        assert_eq!(during, 0, "held back while initialize runs");
+        assert_eq!(
+            delivered,
+            libc::SIGHUP,
+            "delivered to the app's handler, not Chromium's"
+        );
     }
 
     /// Asserts that only an `Initialize` failure with exit code 21 or 24 reports the root as in

@@ -172,6 +172,14 @@ impl MessageLoopPlugin {
             }
         }
 
+        // Without the mark early_exit_if_subprocess gives the browser process, Chromium moves it
+        // into a systemd scope of its own, out of the cgroup it was started in.
+        #[cfg(target_os = "linux")]
+        if keep_cgroup_env(|name| std::env::var_os(name)).is_some() {
+            bevy::log::warn!(
+                "bevy_cef: early_exit_if_subprocess() did not run first in main: Chromium will move this process into a systemd scope of its own (out of its cgroup's memory cap)"
+            );
+        }
         #[cfg(not(target_os = "macos"))]
         cef_initialize(
             &args,
@@ -448,6 +456,53 @@ pub fn early_exit_if_subprocess() {
     );
     if ret >= 0 {
         std::process::exit(ret);
+    }
+    // The browser process: still single-threaded here, so the environment may be written.
+    #[cfg(target_os = "linux")]
+    if let Some((name, value)) = keep_cgroup_env(|name| std::env::var_os(name)) {
+        // SAFETY: no other thread exists yet (this runs first in `main`, before the app is built).
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// What keeps the browser process in the cgroup it was started in, if anything is missing.
+///
+/// Chromium registers with the xdg desktop portal by asking systemd, over the session bus, for a
+/// transient scope (`app-<name>-<pid>.scope`) and moving the browser process into it: with CEF in
+/// process, that is the whole app, which leaves the cgroup it was started in (a memory cap, a
+/// job's CPU accounting: zero's guarded runs lost both, #847). Chromium skips that only when it
+/// believes it is in a sandbox that names the app itself (components/dbus/xdg/systemd.cc
+/// `SetSystemdScopeUnitNameForXdgPortal`, `base::nix::GetAppSandbox`): a Flatpak, or a Snap,
+/// which this CEF (156) reads from a non-empty `SNAP` alone; newer Chromium wants `SNAP_NAME`
+/// too. There is no switch or feature for it. So the browser process gets a `SNAP` naming no
+/// directory: GLib, which also reads `SNAP`, takes a snap only where `$SNAP/meta/snap.yaml`
+/// exists, so nothing else in the process changes its mind. Price: the portal does not get the
+/// app's name from a systemd unit (nothing here asks the portal for anything that needs it), and
+/// every process the app starts inherits the variable. A caller's own `SNAP` is left alone.
+#[cfg(target_os = "linux")]
+fn keep_cgroup_env(
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<(&'static str, &'static str)> {
+    get(KEEP_CGROUP.0)
+        .is_none_or(|v| v.is_empty())
+        .then_some(KEEP_CGROUP)
+}
+
+/// The variable [`keep_cgroup_env`] sets, and its value: a path that is no snap.
+#[cfg(target_os = "linux")]
+const KEEP_CGROUP: (&str, &str) = ("SNAP", "/nonexistent/bevy_cef-not-a-snap");
+
+#[cfg(all(test, target_os = "linux"))]
+mod keep_cgroup_tests {
+    use super::*;
+
+    #[test]
+    fn the_browser_process_is_marked_so_chromium_leaves_its_cgroup_alone() {
+        assert_eq!(keep_cgroup_env(|_| None), Some(KEEP_CGROUP));
+        assert_eq!(keep_cgroup_env(|_| Some("".into())), Some(KEEP_CGROUP));
+        assert_eq!(keep_cgroup_env(|_| Some("/snap/app/1".into())), None);
+        // No snap's metadata where it points, so GLib does not take the app for a snap.
+        assert!(!std::path::Path::new(KEEP_CGROUP.1).join("meta/snap.yaml").exists());
     }
 }
 

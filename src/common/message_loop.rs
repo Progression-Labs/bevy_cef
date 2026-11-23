@@ -351,21 +351,33 @@ fn cef_initialize(
         .unwrap_or_default()
         .into();
 
-    let settings = Settings {
-        browser_subprocess_path: subprocess_path.as_str().into(),
-        no_sandbox: no_sandbox as _,
-        root_cache_path: root_cache_path.unwrap_or_default().into(),
-        windowless_rendering_enabled: true as _,
-        external_message_pump: true as _,
-        disable_signal_handlers: false as _,
-        ..Default::default()
-    };
+    let settings = settings(&subprocess_path, root_cache_path, no_sandbox);
     initialize_result(initialize(
         Some(args.as_main_args()),
         Some(&settings),
         Some(cef_app),
         std::ptr::null_mut(),
     ))
+}
+
+/// The browser process's settings off macOS. Signals are the app's: with CEF's own handlers
+/// (`disable_signal_handlers` false) Chromium's shutdown detector took SIGTERM and SIGHUP and
+/// ended the whole process with status 0 half a second later, no teardown and nothing logged, so
+/// anything that stopped the app (a timeout, a memory cap's OOM kill stopping its systemd
+/// scope) read as success: a zero benchmark the OOM killer stopped mid-load went up as a run.
+/// The flag is Linux's alone (CEF ignores it on Windows), so turning it back on in #31 for
+/// Windows' subprocesses brought the handlers back on Linux only.
+#[cfg(not(target_os = "macos"))]
+fn settings(subprocess_path: &str, root_cache_path: Option<&str>, no_sandbox: bool) -> Settings {
+    Settings {
+        browser_subprocess_path: subprocess_path.into(),
+        no_sandbox: no_sandbox as _,
+        root_cache_path: root_cache_path.unwrap_or_default().into(),
+        windowless_rendering_enabled: true as _,
+        external_message_pump: true as _,
+        disable_signal_handlers: true as _,
+        ..Default::default()
+    }
 }
 
 fn cef_do_message_loop_work(
@@ -648,6 +660,16 @@ mod tests {
     /// Case: a second process starts against a root cache directory that the first process
     /// already holds, and CEF exits initialization with its profile-in-use or
     /// process-notified code.
+    /// Asserts that CEF installs no signal handlers of its own: a SIGTERM'd app ends by its
+    /// signal (or its own handler), never with Chromium's status 0.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn signals_are_the_apps_not_chromiums() {
+        let settings = settings("/x/render", Some("/x/cache"), true);
+        assert_eq!(settings.disable_signal_handlers, 1);
+        assert_eq!(settings.external_message_pump, 1);
+    }
+
     #[test]
     fn root_in_use_covers_codes_21_and_24() {
         assert!(CefStartupError::Initialize { exit_code: 21 }.is_root_in_use());

@@ -369,8 +369,8 @@ fn cef_initialize(
 
 /// The signals Chromium's browser process takes over as it starts, whatever
 /// `disable_signal_handlers` says: its shutdown detector's. Under `strace -f` around zero's game
-/// libcef.so installed handlers on SIGTERM, SIGHUP and SIGINT during initialize (their handlers beside each other in
-/// the library). Each goes back to what the app had: SIGINT to Bevy's Ctrl+C handler where the
+/// libcef.so installed handlers on SIGTERM, SIGHUP and SIGINT during initialize, side by side in
+/// the library. Each goes back to what the app had: SIGINT to Bevy's Ctrl+C handler where the
 /// app has `TerminalCtrlCHandlerPlugin`, else the default.
 #[cfg(target_os = "linux")]
 const APP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];

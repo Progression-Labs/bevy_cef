@@ -368,38 +368,67 @@ fn cef_initialize(
 }
 
 /// The signals Chromium's browser process takes over as it starts, whatever
-/// `disable_signal_handlers` says: its shutdown detector's.
+/// `disable_signal_handlers` says: its shutdown detector's. Under `strace -f` around zero's game
+/// libcef.so installed handlers on SIGTERM, SIGHUP and SIGINT during initialize (their handlers beside each other in
+/// the library). Each goes back to what the app had: SIGINT to Bevy's Ctrl+C handler where the
+/// app has `TerminalCtrlCHandlerPlugin`, else the default.
 #[cfg(target_os = "linux")]
-const APP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
+const APP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 
-/// Runs `f` (CEF's initialize) and gives the [`APP_SIGNALS`] back what they were before it. With
-/// Chromium's shutdown detector on SIGTERM and SIGHUP the process ended with status 0 half a
-/// second after either, no teardown and nothing logged: anything that stopped the app (a timeout,
-/// a memory cap's OOM kill stopping its systemd scope) read as success, and a zero benchmark the
-/// OOM killer stopped mid-load went up as a run. `disable_signal_handlers` does not keep them:
-/// measured on zero's game with it set (Linux, CEF 156), libcef.so still installed both, and a
-/// SIGTERM 60 s in ended the game 0 after 0.50 s. The detector's thread is left waiting on its
-/// pipe for a signal that never comes.
+/// Runs `f` (CEF's initialize) and gives the [`APP_SIGNALS`] back what they were before it, also
+/// when `f` unwinds. With Chromium's shutdown detector on SIGTERM and SIGHUP the process ended
+/// with status 0 half a second after either, no teardown and nothing logged: anything that
+/// stopped the app (a timeout, a memory cap's OOM kill stopping its systemd scope) read as
+/// success, and a zero benchmark the OOM killer stopped mid-load went up as a run.
+/// `disable_signal_handlers` does not keep them: measured on zero's game with it set (Linux, CEF
+/// 156, under `strace -f`), libcef.so installed its handlers during initialize and nothing after
+/// it in the next 60 s of play, and a SIGTERM then ended the game 0 after 0.50 s; with this, the
+/// game is killed by the SIGTERM (143). The detector's thread is left waiting on its pipe for a
+/// signal that never comes. A signal that arrives while initialize runs (its first half second
+/// in zero's game) still meets the detector: the app's whole life after it does not.
 #[cfg(target_os = "linux")]
 fn keeping_app_signals<T>(f: impl FnOnce() -> T) -> T {
-    // SAFETY: sigaction(2) reading a signal's disposition into a zeroed struct.
-    let kept = APP_SIGNALS.map(|signal| unsafe {
-        let mut was: libc::sigaction = std::mem::zeroed();
-        libc::sigaction(signal, std::ptr::null(), &mut was);
-        (signal, was)
-    });
-    let out = f();
-    for (signal, was) in &kept {
-        // SAFETY: sigaction(2) putting back a disposition it read.
-        unsafe { libc::sigaction(*signal, was, std::ptr::null_mut()) };
+    /// Puts each disposition read back when dropped: after `f`, returned or unwound.
+    struct Kept(Vec<(libc::c_int, libc::sigaction)>);
+    impl Drop for Kept {
+        fn drop(&mut self) {
+            for (signal, was) in &self.0 {
+                // SAFETY: sigaction(2) putting back a disposition it read.
+                if unsafe { libc::sigaction(*signal, was, std::ptr::null_mut()) } != 0 {
+                    bevy::log::warn!(
+                        "CEF: signal {signal} could not be given back to the app after CEF's initialize ({}): Chromium's shutdown detector keeps it",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
     }
-    out
+    let _kept = Kept(
+        APP_SIGNALS
+            .into_iter()
+            .filter_map(|signal| {
+                // SAFETY: sigaction(2) reading a signal's disposition into a zeroed struct.
+                let mut was: libc::sigaction = unsafe { std::mem::zeroed() };
+                if unsafe { libc::sigaction(signal, std::ptr::null(), &mut was) } == 0 {
+                    Some((signal, was))
+                } else {
+                    // Put back nothing for it rather than a zeroed (default) disposition.
+                    bevy::log::warn!(
+                        "CEF: signal {signal}'s disposition could not be read ({}): whatever CEF's initialize puts on it stays",
+                        std::io::Error::last_os_error()
+                    );
+                    None
+                }
+            })
+            .collect(),
+    );
+    f()
 }
 
 /// The browser process's settings off macOS. Signals are the app's: CEF configures none of its
-/// own (`disable_signal_handlers`, Linux's alone: CEF ignores it on Windows, so turning it back
-/// on in #31 for Windows' subprocesses changed only Linux). Chromium's shutdown detector takes
-/// SIGTERM and SIGHUP all the same, which [`keeping_app_signals`] undoes.
+/// own (`disable_signal_handlers`: "on POSIX systems", cef_types.h, so turning it back on in #31
+/// for Windows' subprocesses changed only Linux). Chromium's shutdown detector takes SIGTERM,
+/// SIGINT and SIGHUP all the same, which [`keeping_app_signals`] undoes.
 #[cfg(not(target_os = "macos"))]
 fn settings(subprocess_path: &str, root_cache_path: Option<&str>, no_sandbox: bool) -> Settings {
     Settings {
@@ -687,12 +716,6 @@ mod tests {
     use super::*;
     use crate::common::JsEmitEventPlugin;
 
-    /// Asserts that only an `Initialize` failure with exit code 21 or 24 reports the root as in
-    /// use, and every other error does not.
-    ///
-    /// Case: a second process starts against a root cache directory that the first process
-    /// already holds, and CEF exits initialization with its profile-in-use or
-    /// process-notified code.
     /// Asserts that CEF is asked to configure no signal handlers of its own.
     #[cfg(not(target_os = "macos"))]
     #[test]
@@ -702,35 +725,53 @@ mod tests {
         assert_eq!(settings.external_message_pump, 1);
     }
 
-    /// Asserts that whatever CEF's initialize puts on SIGTERM and SIGHUP is undone: each signal's
-    /// disposition after it is the one before it.
+    /// Asserts that whatever CEF's initialize puts on SIGTERM, SIGINT and SIGHUP is undone: each
+    /// signal's disposition after it is the one before it, also when it unwinds.
     ///
-    /// Case: a stand-in for initialize that installs a handler on both, as Chromium's shutdown
-    /// detector does (it ended a SIGTERM'd game with status 0).
+    /// Case: a stand-in for initialize that installs a handler on each, as Chromium's shutdown
+    /// detector does (it ended a SIGTERM'd game with status 0), then one that also panics.
     #[cfg(target_os = "linux")]
     #[test]
-    fn initialize_leaves_sigterm_and_sighup_as_the_app_had_them() {
+    fn initialize_leaves_the_apps_signals_as_it_had_them() {
         extern "C" fn chromiums(_: libc::c_int) {}
+        let chromiums = chromiums as *const () as libc::sighandler_t;
         let handler = |signal| unsafe {
             let mut now: libc::sigaction = std::mem::zeroed();
             libc::sigaction(signal, std::ptr::null(), &mut now);
             now.sa_sigaction
         };
-        let before = APP_SIGNALS.map(handler);
-        let installed = keeping_app_signals(|| {
+        let take = || {
             for signal in APP_SIGNALS {
                 unsafe {
                     let mut taken: libc::sigaction = std::mem::zeroed();
-                    taken.sa_sigaction = chromiums as *const () as libc::sighandler_t;
+                    taken.sa_sigaction = chromiums;
                     libc::sigaction(signal, &taken, std::ptr::null_mut());
                 }
             }
             APP_SIGNALS.map(handler)
+        };
+        let before = APP_SIGNALS.map(handler);
+        let installed = keeping_app_signals(take);
+        let after = APP_SIGNALS.map(handler);
+        let unwound = std::panic::catch_unwind(|| {
+            keeping_app_signals(|| {
+                take();
+                panic!("a callback during initialize");
+            })
         });
-        assert_eq!(installed, [chromiums as *const () as libc::sighandler_t; 2]);
-        assert_eq!(APP_SIGNALS.map(handler), before);
+        let after_unwinding = APP_SIGNALS.map(handler);
+        assert_eq!(installed, [chromiums; 3]);
+        assert_eq!(after, before);
+        assert!(unwound.is_err());
+        assert_eq!(after_unwinding, before);
     }
 
+    /// Asserts that only an `Initialize` failure with exit code 21 or 24 reports the root as in
+    /// use, and every other error does not.
+    ///
+    /// Case: a second process starts against a root cache directory that the first process
+    /// already holds, and CEF exits initialization with its profile-in-use or
+    /// process-notified code.
     #[test]
     fn root_in_use_covers_codes_21_and_24() {
         assert!(CefStartupError::Initialize { exit_code: 21 }.is_root_in_use());

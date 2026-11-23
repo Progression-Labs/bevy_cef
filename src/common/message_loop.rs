@@ -502,7 +502,11 @@ mod keep_cgroup_tests {
         assert_eq!(keep_cgroup_env(|_| Some("".into())), Some(KEEP_CGROUP));
         assert_eq!(keep_cgroup_env(|_| Some("/snap/app/1".into())), None);
         // No snap's metadata where it points, so GLib does not take the app for a snap.
-        assert!(!std::path::Path::new(KEEP_CGROUP.1).join("meta/snap.yaml").exists());
+        assert!(
+            !std::path::Path::new(KEEP_CGROUP.1)
+                .join("meta/snap.yaml")
+                .exists()
+        );
     }
 }
 

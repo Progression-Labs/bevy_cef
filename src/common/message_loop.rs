@@ -351,7 +351,15 @@ fn cef_initialize(
         .unwrap_or_default()
         .into();
 
-    let settings = settings(&subprocess_path, root_cache_path, no_sandbox);
+    let settings = Settings {
+        browser_subprocess_path: subprocess_path.as_str().into(),
+        no_sandbox: no_sandbox as _,
+        root_cache_path: root_cache_path.unwrap_or_default().into(),
+        windowless_rendering_enabled: true as _,
+        external_message_pump: true as _,
+        disable_signal_handlers: false as _,
+        ..Default::default()
+    };
     let initialize = || {
         initialize(
             Some(args.as_main_args()),
@@ -380,10 +388,10 @@ const APP_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP
 /// with status 0 half a second after either, no teardown and nothing logged: anything that
 /// stopped the app (a timeout, a memory cap's OOM kill stopping its systemd scope) read as
 /// success, and a zero benchmark the OOM killer stopped mid-load went up as a run.
-/// `disable_signal_handlers` does not keep them: measured on zero's game with it set (Linux, CEF
-/// 156, under `strace -f`), libcef.so installed its handlers during initialize and nothing after
-/// it in the next 60 s of play, and a SIGTERM then ended the game 0 after 0.50 s; with this, the
-/// game is killed by the SIGTERM (143). The detector's thread is left waiting on its pipe for a
+/// Setting `disable_signal_handlers` does not keep them, so it stays false: measured on zero's
+/// game with it true (Linux, CEF 156, under `strace -f`), libcef.so installed its handlers
+/// during initialize and nothing after it in the next 60 s of play, and a SIGTERM then ended the
+/// game 0 after 0.50 s; with this, the game is killed by the SIGTERM (143). The detector's thread is left waiting on its pipe for a
 /// signal that never comes. A signal that arrives while initialize runs (its first half second
 /// in zero's game) still meets the detector: the app's whole life after it does not.
 #[cfg(target_os = "linux")]
@@ -423,23 +431,6 @@ fn keeping_app_signals<T>(f: impl FnOnce() -> T) -> T {
             .collect(),
     );
     f()
-}
-
-/// The browser process's settings off macOS. Signals are the app's: CEF configures none of its
-/// own (`disable_signal_handlers`: "on POSIX systems", cef_types.h, so turning it back on in #31
-/// for Windows' subprocesses changed only Linux). Chromium's shutdown detector takes SIGTERM,
-/// SIGINT and SIGHUP all the same, which [`keeping_app_signals`] undoes.
-#[cfg(not(target_os = "macos"))]
-fn settings(subprocess_path: &str, root_cache_path: Option<&str>, no_sandbox: bool) -> Settings {
-    Settings {
-        browser_subprocess_path: subprocess_path.into(),
-        no_sandbox: no_sandbox as _,
-        root_cache_path: root_cache_path.unwrap_or_default().into(),
-        windowless_rendering_enabled: true as _,
-        external_message_pump: true as _,
-        disable_signal_handlers: true as _,
-        ..Default::default()
-    }
 }
 
 fn cef_do_message_loop_work(
@@ -715,15 +706,6 @@ mod macos {
 mod tests {
     use super::*;
     use crate::common::JsEmitEventPlugin;
-
-    /// Asserts that CEF is asked to configure no signal handlers of its own.
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn cef_is_asked_to_leave_signals_to_the_app() {
-        let settings = settings("/x/render", Some("/x/cache"), true);
-        assert_eq!(settings.disable_signal_handlers, 1);
-        assert_eq!(settings.external_message_pump, 1);
-    }
 
     /// Asserts that whatever CEF's initialize puts on SIGTERM, SIGINT and SIGHUP is undone: each
     /// signal's disposition after it is the one before it, also when it unwinds.

@@ -86,6 +86,8 @@ objc = { version = "0.2" }
 # Bevy's default features (which would pull in `x11`) are disabled workspace-wide.
 [target.'cfg(target_os = "linux")'.dependencies]
 bevy = { workspace = true, features = ["x11", "wayland"] }
+# Gives SIGTERM and SIGHUP back to the app after CEF's initialize (message_loop.rs).
+libc = "0.2"
 
 [lints]
 workspace = true

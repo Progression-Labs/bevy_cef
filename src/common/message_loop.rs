@@ -352,21 +352,54 @@ fn cef_initialize(
         .into();
 
     let settings = settings(&subprocess_path, root_cache_path, no_sandbox);
-    initialize_result(initialize(
-        Some(args.as_main_args()),
-        Some(&settings),
-        Some(cef_app),
-        std::ptr::null_mut(),
-    ))
+    let initialize = || {
+        initialize(
+            Some(args.as_main_args()),
+            Some(&settings),
+            Some(cef_app),
+            std::ptr::null_mut(),
+        )
+    };
+    #[cfg(target_os = "linux")]
+    let initialized = keeping_app_signals(initialize);
+    #[cfg(not(target_os = "linux"))]
+    let initialized = initialize();
+    initialize_result(initialized)
 }
 
-/// The browser process's settings off macOS. Signals are the app's: with CEF's own handlers
-/// (`disable_signal_handlers` false) Chromium's shutdown detector took SIGTERM and SIGHUP and
-/// ended the whole process with status 0 half a second later, no teardown and nothing logged, so
-/// anything that stopped the app (a timeout, a memory cap's OOM kill stopping its systemd
-/// scope) read as success: a zero benchmark the OOM killer stopped mid-load went up as a run.
-/// The flag is Linux's alone (CEF ignores it on Windows), so turning it back on in #31 for
-/// Windows' subprocesses brought the handlers back on Linux only.
+/// The signals Chromium's browser process takes over as it starts, whatever
+/// `disable_signal_handlers` says: its shutdown detector's.
+#[cfg(target_os = "linux")]
+const APP_SIGNALS: [libc::c_int; 2] = [libc::SIGTERM, libc::SIGHUP];
+
+/// Runs `f` (CEF's initialize) and gives the [`APP_SIGNALS`] back what they were before it. With
+/// Chromium's shutdown detector on SIGTERM and SIGHUP the process ended with status 0 half a
+/// second after either, no teardown and nothing logged: anything that stopped the app (a timeout,
+/// a memory cap's OOM kill stopping its systemd scope) read as success, and a zero benchmark the
+/// OOM killer stopped mid-load went up as a run. `disable_signal_handlers` does not keep them:
+/// measured on zero's game with it set (Linux, CEF 156), libcef.so still installed both, and a
+/// SIGTERM 60 s in ended the game 0 after 0.50 s. The detector's thread is left waiting on its
+/// pipe for a signal that never comes.
+#[cfg(target_os = "linux")]
+fn keeping_app_signals<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: sigaction(2) reading a signal's disposition into a zeroed struct.
+    let kept = APP_SIGNALS.map(|signal| unsafe {
+        let mut was: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(signal, std::ptr::null(), &mut was);
+        (signal, was)
+    });
+    let out = f();
+    for (signal, was) in &kept {
+        // SAFETY: sigaction(2) putting back a disposition it read.
+        unsafe { libc::sigaction(*signal, was, std::ptr::null_mut()) };
+    }
+    out
+}
+
+/// The browser process's settings off macOS. Signals are the app's: CEF configures none of its
+/// own (`disable_signal_handlers`, Linux's alone: CEF ignores it on Windows, so turning it back
+/// on in #31 for Windows' subprocesses changed only Linux). Chromium's shutdown detector takes
+/// SIGTERM and SIGHUP all the same, which [`keeping_app_signals`] undoes.
 #[cfg(not(target_os = "macos"))]
 fn settings(subprocess_path: &str, root_cache_path: Option<&str>, no_sandbox: bool) -> Settings {
     Settings {
@@ -660,14 +693,42 @@ mod tests {
     /// Case: a second process starts against a root cache directory that the first process
     /// already holds, and CEF exits initialization with its profile-in-use or
     /// process-notified code.
-    /// Asserts that CEF installs no signal handlers of its own: a SIGTERM'd app ends by its
-    /// signal (or its own handler), never with Chromium's status 0.
+    /// Asserts that CEF is asked to configure no signal handlers of its own.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn signals_are_the_apps_not_chromiums() {
+    fn cef_is_asked_to_leave_signals_to_the_app() {
         let settings = settings("/x/render", Some("/x/cache"), true);
         assert_eq!(settings.disable_signal_handlers, 1);
         assert_eq!(settings.external_message_pump, 1);
+    }
+
+    /// Asserts that whatever CEF's initialize puts on SIGTERM and SIGHUP is undone: each signal's
+    /// disposition after it is the one before it.
+    ///
+    /// Case: a stand-in for initialize that installs a handler on both, as Chromium's shutdown
+    /// detector does (it ended a SIGTERM'd game with status 0).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn initialize_leaves_sigterm_and_sighup_as_the_app_had_them() {
+        extern "C" fn chromiums(_: libc::c_int) {}
+        let handler = |signal| unsafe {
+            let mut now: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal, std::ptr::null(), &mut now);
+            now.sa_sigaction
+        };
+        let before = APP_SIGNALS.map(handler);
+        let installed = keeping_app_signals(|| {
+            for signal in APP_SIGNALS {
+                unsafe {
+                    let mut taken: libc::sigaction = std::mem::zeroed();
+                    taken.sa_sigaction = chromiums as *const () as libc::sighandler_t;
+                    libc::sigaction(signal, &taken, std::ptr::null_mut());
+                }
+            }
+            APP_SIGNALS.map(handler)
+        });
+        assert_eq!(installed, [chromiums as *const () as libc::sighandler_t; 2]);
+        assert_eq!(APP_SIGNALS.map(handler), before);
     }
 
     #[test]
